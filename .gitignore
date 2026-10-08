@@ -2,3 +2,4 @@ venv/
 output/
 __pycache__/
 *.pyc
+data/risk_model.pkl
