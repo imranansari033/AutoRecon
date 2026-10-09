@@ -1,8 +1,10 @@
-import dns.resolver
+import random
+import string
 import threading
 from queue import Queue
 
-# ── default wordlist (small built-in) ──────────────────────────────────────
+import dns.resolver
+
 DEFAULT_WORDLIST = [
     "www", "mail", "ftp", "admin", "api", "dev", "test", "staging",
     "portal", "vpn", "remote", "blog", "shop", "app", "cdn", "static",
@@ -12,56 +14,68 @@ DEFAULT_WORDLIST = [
     "host", "login", "secure", "auth", "sso", "beta", "v1", "v2"
 ]
 
-found_subdomains = []   # shared list across threads
-lock = threading.Lock() # thread-safe writes
+found_subdomains = []
+wildcard_ips = set()
+lock = threading.Lock()
+
+
+def get_wildcard_ips(domain: str) -> set:
+    """Resolve a random nonexistent subdomain. If it resolves, the domain uses wildcard DNS."""
+    rand = "".join(random.choices(string.ascii_lowercase, k=12))
+    try:
+        answers = dns.resolver.resolve(f"{rand}.{domain}", "A")
+        return {str(r) for r in answers}
+    except Exception:
+        return set()
 
 
 def resolve_subdomain(subdomain: str, domain: str):
-    """Try to resolve a subdomain. If it resolves → it exists."""
     fqdn = f"{subdomain}.{domain}"
     try:
         answers = dns.resolver.resolve(fqdn, "A")
         ips = [str(r) for r in answers]
+
+        if wildcard_ips and set(ips) == wildcard_ips:
+            return  # wildcard fake hit
+
         with lock:
             found_subdomains.append({"subdomain": fqdn, "ips": ips})
             print(f"  [+] FOUND → {fqdn} : {', '.join(ips)}")
     except Exception:
-        pass  # subdomain doesn't exist, skip silently
+        pass
 
 
 def subdomain_enum(domain: str, wordlist: list = None, threads: int = 20) -> dict:
-    """
-    Enumerate subdomains using wordlist + threading.
-    threads: number of concurrent threads (default 20)
-    """
-    global found_subdomains
-    found_subdomains = []  # reset for each run
+    global found_subdomains, wildcard_ips
+    found_subdomains = []
+    wildcard_ips = get_wildcard_ips(domain)
 
     wordlist = wordlist or DEFAULT_WORDLIST
     queue = Queue()
-
-    # Fill queue with all words
     for word in wordlist:
         queue.put(word)
 
     print(f"\n[*] Starting subdomain enum on: {domain}")
-    print(f"[*] Wordlist size: {len(wordlist)} | Threads: {threads}\n")
+    print(f"[*] Wordlist size: {len(wordlist)} | Threads: {threads}")
+    if wildcard_ips:
+        print(f"[!] Wildcard DNS detected ({', '.join(wildcard_ips)}), filtering fake hits")
+    print()
 
     def worker():
-        while not queue.empty():
-            word = queue.get()
+        while True:
+            try:
+                word = queue.get_nowait()
+            except Exception:
+                return
             resolve_subdomain(word, domain)
             queue.task_done()
 
-    # Spawn threads
     thread_list = []
     for _ in range(threads):
-        t = threading.Thread(target=worker)
-        t.daemon = True
+        t = threading.Thread(target=worker, daemon=True)
         t.start()
         thread_list.append(t)
 
-    # Wait for all threads to finish
     for t in thread_list:
         t.join()
 
@@ -69,12 +83,12 @@ def subdomain_enum(domain: str, wordlist: list = None, threads: int = 20) -> dic
         "status": "success",
         "domain": domain,
         "found": len(found_subdomains),
-        "subdomains": found_subdomains
+        "subdomains": found_subdomains,
+        "wildcard": bool(wildcard_ips)
     }
 
 
 def load_wordlist(filepath: str) -> list:
-    """Load external wordlist file (one word per line)."""
     try:
         with open(filepath, "r") as f:
             words = [line.strip() for line in f if line.strip()]
@@ -86,15 +100,15 @@ def load_wordlist(filepath: str) -> list:
 
 
 def print_subdomain_results(result: dict):
-    print("\n" + "="*40)
+    print("\n" + "=" * 40)
     print("  SUBDOMAIN ENUMERATION RESULTS")
-    print("="*40)
+    print("=" * 40)
     print(f"  Domain : {result['domain']}")
     print(f"  Found  : {result['found']} subdomains")
-    print("-"*40)
+    print("-" * 40)
     for entry in result["subdomains"]:
         print(f"  {entry['subdomain']:<35} → {', '.join(entry['ips'])}")
-    print("="*40 + "\n")
+    print("=" * 40 + "\n")
 
 
 if __name__ == "__main__":
@@ -104,11 +118,5 @@ if __name__ == "__main__":
     print("2. Load custom wordlist file")
     choice = input("Choose: ")
 
-    if choice == "2":
-        path = input("Wordlist path: ")
-        wordlist = load_wordlist(path)
-    else:
-        wordlist = DEFAULT_WORDLIST
-
-    result = subdomain_enum(domain, wordlist)
-    print_subdomain_results(result)
+    wordlist = load_wordlist(input("Wordlist path: ")) if choice == "2" else DEFAULT_WORDLIST
+    print_subdomain_results(subdomain_enum(domain, wordlist))

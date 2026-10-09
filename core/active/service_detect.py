@@ -1,46 +1,52 @@
-import socket
 import re
+import socket
+import ssl
 
-# Probes to send for specific ports to trigger a banner response
+TLS_PORTS = {443, 8443}
+
 PORT_PROBES = {
-    21:   b"",                        # FTP sends banner automatically
-    22:   b"",                        # SSH sends banner automatically
-    25:   b"EHLO test\r\n",           # SMTP
-    80:   b"HEAD / HTTP/1.0\r\n\r\n", # HTTP
-    443:  b"",                        # HTTPS (banner grab limited without TLS)
-    110:  b"",                        # POP3 sends banner automatically
-    143:  b"",                        # IMAP sends banner automatically
-    3306: b"",                        # MySQL sends banner automatically
-    6379: b"INFO\r\n",                # Redis
-    27017: b"",                       # MongoDB
+    25:   b"EHLO test\r\n",
+    6379: b"INFO\r\n",
 }
 
-DEFAULT_PROBE = b"HEAD / HTTP/1.0\r\n\r\n"
+
+def http_probe(host: str) -> bytes:
+    return (
+        f"HEAD / HTTP/1.1\r\nHost: {host}\r\n"
+        f"User-Agent: AutoRecon\r\nConnection: close\r\n\r\n"
+    ).encode()
 
 
-def grab_banner(ip: str, port: int, timeout: float = 2.0) -> dict:
-    """
-    Connect to open port and grab the service banner.
-    Returns version/service info if available.
-    """
+def grab_banner(ip: str, port: int, host: str = None, timeout: float = 3.0) -> dict:
+    """Connect to open port and grab the service banner (TLS-aware)."""
+    host = host or ip
     try:
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock = socket.create_connection((ip, port), timeout=timeout)
         sock.settimeout(timeout)
-        sock.connect((ip, port))
 
-        # Send probe if we have one for this port
-        probe = PORT_PROBES.get(port, DEFAULT_PROBE)
+        if port in TLS_PORTS:
+            # Recon tool: we want the banner even from self-signed/invalid certs
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            sock = ctx.wrap_socket(sock, server_hostname=host)
+
+        if port in PORT_PROBES:
+            probe = PORT_PROBES[port]
+        elif port in TLS_PORTS or port in (80, 8080, 8888):
+            probe = http_probe(host)
+        else:
+            probe = b""  # SSH, FTP, POP3... send banner automatically
+
         if probe:
             sock.send(probe)
 
-        # Receive banner (up to 1024 bytes)
         banner = sock.recv(1024).decode("utf-8", errors="ignore").strip()
         sock.close()
 
-        # Clean up banner — remove extra whitespace/newlines
         banner_clean = " | ".join(
             line.strip() for line in banner.splitlines() if line.strip()
-        )[:200]  # limit to 200 chars
+        )[:300]
 
         return {
             "status": "success",
@@ -57,39 +63,37 @@ def grab_banner(ip: str, port: int, timeout: float = 2.0) -> dict:
         return {"status": "error", "port": port, "banner": str(e), "version": None}
 
 
-def extract_version(banner: str) -> str:
+def extract_version(banner: str):
     """
-    Try to extract version string from banner using regex.
-    Examples:
-      'SSH-2.0-OpenSSH_8.9p1'  → 'OpenSSH_8.9p1'
-      'Apache/2.4.41'          → 'Apache/2.4.41'
-      'nginx/1.18.0'           → 'nginx/1.18.0'
+    'SSH-2.0-OpenSSH_8.9p1' -> 'OpenSSH_8.9p1'
+    'Server: Apache/2.4.41' -> 'Apache/2.4.41'
     """
     patterns = [
-        r"(OpenSSH[\w._-]+)",           # SSH
-        r"(Apache/[\d.]+)",             # Apache
-        r"(nginx/[\d.]+)",              # Nginx
-        r"(vsftpd[\s/][\d.]+)",         # FTP
-        r"(MySQL[\s/][\d.]+)",          # MySQL
-        r"(Microsoft-IIS/[\d.]+)",      # IIS
-        r"(PHP/[\d.]+)",                # PHP
-        r"(OpenSSL/[\d.]+)",            # OpenSSL
-        r"(\d+\.\d+\.\d+)",             # Generic version x.x.x
+        r"(OpenSSH[\w._-]+)",
+        r"(Apache/[\d.]+)",
+        r"(nginx/[\d.]+)",
+        r"(vsftpd[\s/][\d.]+)",
+        r"(MySQL[\s/][\d.]+)",
+        r"(Microsoft-IIS/[\d.]+)",
+        r"(PHP/[\d.]+)",
+        r"(OpenSSL/[\d.]+)",
     ]
-
     for pattern in patterns:
         match = re.search(pattern, banner, re.IGNORECASE)
         if match:
             return match.group(1)
 
+    # Generic x.y.z only from the Server header (avoids matching dates/IPs)
+    server = re.search(r"Server:\s*([^|]+)", banner, re.IGNORECASE)
+    if server:
+        generic = re.search(r"(\d+\.\d+\.\d+)", server.group(1))
+        if generic:
+            return server.group(1).strip()
     return None
 
 
 def service_detect(target: str, open_ports: list) -> dict:
-    """
-    Run banner grabbing on all open ports from port scan results.
-    open_ports: list of dicts from port_scanner → [{"port": 80, "service": "HTTP"}, ...]
-    """
+    """Run banner grabbing on all open ports from port scan results."""
     try:
         ip = socket.gethostbyname(target)
     except socket.gaierror:
@@ -104,17 +108,11 @@ def service_detect(target: str, open_ports: list) -> dict:
         service = entry.get("service", "Unknown")
         print(f"  [~] Probing port {port} ({service})...")
 
-        banner_result = grab_banner(ip, port)
-        banner_result["service"] = service  # attach service name
-
+        banner_result = grab_banner(ip, port, host=target)
+        banner_result["service"] = service
         results.append(banner_result)
 
-    return {
-        "status": "success",
-        "target": target,
-        "ip": ip,
-        "services": results
-    }
+    return {"status": "success", "target": target, "ip": ip, "services": results}
 
 
 def print_service_results(result: dict):
@@ -122,26 +120,23 @@ def print_service_results(result: dict):
         print(f"[!] {result['message']}")
         return
 
-    print("\n" + "="*55)
+    print("\n" + "=" * 60)
     print("  SERVICE DETECTION RESULTS")
-    print("="*55)
+    print("=" * 60)
     print(f"  Target: {result['target']} ({result['ip']})")
-    print("-"*55)
+    print("-" * 60)
     print(f"  {'PORT':<7} {'SERVICE':<12} {'VERSION':<18} BANNER")
-    print("-"*55)
+    print("-" * 60)
 
     for s in result["services"]:
-        port    = s.get("port", "?")
-        service = s.get("service", "Unknown")
         version = s.get("version") or "N/A"
-        banner  = s.get("banner", "")[:40]  # truncate for display
-        print(f"  {port:<7} {service:<12} {version:<18} {banner}")
+        banner  = s.get("banner", "")[:40]
+        print(f"  {s.get('port', '?'):<7} {s.get('service', 'Unknown'):<12} {version:<18} {banner}")
 
-    print("="*55 + "\n")
+    print("=" * 60 + "\n")
 
 
 if __name__ == "__main__":
-    # Simulate using output from port_scanner
     from port_scanner import port_scan
 
     target = input("Enter target (IP or domain): ")
